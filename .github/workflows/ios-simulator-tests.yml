@@ -37,19 +37,19 @@ on:
       device_name:
         description: "Simulator model (must exist on the runner image; macos-26 image lists iPhone 17, iPhone 17 Pro, iPhone Air, ...)"
         type: string
-        default: "iPhone 17"
+        default: "iPhone 16"
       ios_version:
         description: "Simulator iOS version (macos-26 image has 26.2, 26.4, 26.5)"
         type: string
-        default: "26.5"
+        default: "26.0"
       xcode_version:
         description: "Xcode on the runner (macos-26 image has 26.0.1 ... 26.6; 26.6 is default). Repo README needs >= 16.0; its SwiftPM packages need Swift tools 6.2 => Xcode 26+"
         type: string
-        default: "26.6"
+        default: "26.0.1"
       runner:
         description: "Hosted runner label"
         type: string
-        default: "macos-26"
+        default: "macos-15-intel"
       appium_version:
         description: "npm version/tag of appium. 'latest' (v4 at time of writing) works with the newest xcuitest driver; use '2' only together with xcuitest_version '9' (older, may lack iOS 26 fixes - UNVERIFIED)"
         type: string
@@ -58,6 +58,10 @@ on:
         description: "xcuitest driver version (empty = newest compatible with the Appium you chose; e.g. '9' for Appium 2)"
         type: string
         default: ""
+      reuse_app:
+        description: "Reuse the Wikipedia.app built by an earlier run of the same commit (skips the long build). Untick to force a fresh build."
+        type: boolean
+        default: true
       prebuild_wda:
         description: "Build WebDriverAgent once up front and reuse it (saves time per session)"
         type: boolean
@@ -116,7 +120,24 @@ jobs:
           sys.exit(1)')
           echo "UDID=$UDID" | tee -a "$GITHUB_ENV"
 
-      - name: Build Wikipedia for the iOS Simulator (no code signing)
+      # Speed-up: reuse the app from an earlier run of the same commit + Xcode + runner.
+      - name: Restore previously built app
+        id: appcache
+        if: inputs.reuse_app
+        uses: actions/cache/restore@v4
+        with:
+          path: app-cache
+          key: wikipedia-app-v2-${{ github.sha }}-${{ inputs.runner }}-xcode${{ inputs.xcode_version }}
+
+      - name: Use the restored app
+        if: steps.appcache.outputs.cache-hit == 'true'
+        run: |
+          echo "Reusing Wikipedia.app from cache - skipping the build"
+          echo "APP_PATH=${{ github.workspace }}/app-cache/Wikipedia.app" >> "$GITHUB_ENV"
+
+      # Ad-hoc signing ("-") keeps the app's entitlements; without them the app crashes on launch (app group NOT_CODESIGNED).
+      - name: Build Wikipedia for the iOS Simulator (ad-hoc signed)
+        if: steps.appcache.outputs.cache-hit != 'true'
         run: |
           set -o pipefail
           xcodebuild build \
@@ -125,11 +146,19 @@ jobs:
             -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath "$DD" \
             -onlyUsePackageVersionsFromResolvedFile -skipPackagePluginValidation -skipMacroValidation \
-            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="-"  \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="-" \
             2>&1 | tee "$ART/logs/xcodebuild-app.log" | tail -n 40
           APP="$DD/Build/Products/${CONFIGURATION}-iphonesimulator/Wikipedia.app"
           test -d "$APP" || { echo "::error::Wikipedia.app not found at $APP"; find "$DD/Build/Products" -maxdepth 2; exit 1; }
           echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+          mkdir -p app-cache && cp -R "$APP" app-cache/
+
+      - name: Save built app for next runs
+        if: steps.appcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: app-cache
+          key: wikipedia-app-v2-${{ github.sha }}-${{ inputs.runner }}-xcode${{ inputs.xcode_version }}
 
       - name: Install Appium + XCUITest driver
         run: |
