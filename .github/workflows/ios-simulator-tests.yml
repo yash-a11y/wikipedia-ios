@@ -125,7 +125,7 @@ jobs:
             -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath "$DD" \
             -onlyUsePackageVersionsFromResolvedFile -skipPackagePluginValidation -skipMacroValidation \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="-"  \
             2>&1 | tee "$ART/logs/xcodebuild-app.log" | tail -n 40
           APP="$DD/Build/Products/${CONFIGURATION}-iphonesimulator/Wikipedia.app"
           test -d "$APP" || { echo "::error::Wikipedia.app not found at $APP"; find "$DD/Build/Products" -maxdepth 2; exit 1; }
