@@ -1,0 +1,270 @@
+# FREE iOS Appium tests for Wikipedia iOS: GitHub Actions macOS runner + iOS Simulator. No Apple account, no BrowserStack.
+# Install: copy to  .github/workflows/ios-simulator-tests.yml  in a PUBLIC fork of wikimedia/wikipedia-ios
+# (standard GitHub-hosted runners are free for public repos: docs.github.com/en/actions/concepts/billing-and-usage).
+# Run: GitHub web UI -> Actions -> "iOS simulator Appium tests" -> Run workflow.
+# Tests live in the fork under  ui-tests/python  (pytest)  or  ui-tests/java  (Maven)  -- see README.
+# I could not execute this on a macOS runner; items marked UNVERIFIED may need a tweak on the first run.
+name: iOS simulator Appium tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_language:
+        description: "What to run: smoke (built-in launch+screenshot+page-source check, no test code needed), typescript (npm script, e.g. WebdriverIO), python (pytest), java (Maven)"
+        type: choice
+        options: [smoke, typescript, python, java]
+        default: smoke
+      test_dir:
+        description: "python/java only: folder that holds the tests (contains python/ and java/)"
+        type: string
+        default: ui-tests
+      tests_dir:
+        description: "typescript only: folder with package.json (relative to the repo root, or to tests_repo if set)"
+        type: string
+        default: ui-tests/typescript
+      test_command:
+        description: "typescript only: npm command to run the tests"
+        type: string
+        default: "npm run test:ios"
+      tests_repo:
+        description: "OPTIONAL: separate repo with the tests, owner/name (e.g. their existing Android repo). Empty = tests are in this fork"
+        type: string
+        default: ""
+      tests_ref:
+        description: "OPTIONAL: branch/tag/SHA of tests_repo (empty = its default branch)"
+        type: string
+        default: ""
+      device_name:
+        description: "Simulator model (must exist on the runner image; macos-26 image lists iPhone 17, iPhone 17 Pro, iPhone Air, ...)"
+        type: string
+        default: "iPhone 17"
+      ios_version:
+        description: "Simulator iOS version (macos-26 image has 26.2, 26.4, 26.5)"
+        type: string
+        default: "26.5"
+      xcode_version:
+        description: "Xcode on the runner (macos-26 image has 26.0.1 ... 26.6; 26.6 is default). Repo README needs >= 16.0; its SwiftPM packages need Swift tools 6.2 => Xcode 26+"
+        type: string
+        default: "26.6"
+      runner:
+        description: "Hosted runner label"
+        type: string
+        default: "macos-26"
+      appium_version:
+        description: "npm version/tag of appium. 'latest' (v4 at time of writing) works with the newest xcuitest driver; use '2' only together with xcuitest_version '9' (older, may lack iOS 26 fixes - UNVERIFIED)"
+        type: string
+        default: "latest"
+      xcuitest_version:
+        description: "xcuitest driver version (empty = newest compatible with the Appium you chose; e.g. '9' for Appium 2)"
+        type: string
+        default: ""
+      prebuild_wda:
+        description: "Build WebDriverAgent once up front and reuse it (saves time per session)"
+        type: boolean
+        default: true
+
+env:
+  SCHEME: Wikipedia
+  CONFIGURATION: Debug
+  ART: ${{ github.workspace }}/artifacts
+  DD: ${{ github.workspace }}/build-dd
+  WDA_DD: ${{ github.workspace }}/wda-dd
+  APPIUM_URL: http://127.0.0.1:4723
+
+jobs:
+  ios-tests:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      # Only when the tests live in another repo. Private repo: add secret TESTS_REPO_TOKEN (fine-grained PAT, Contents: read-only on that repo).
+      - name: Check out the separate tests repo
+        if: inputs.tests_repo != ''
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.tests_repo }}
+          ref: ${{ inputs.tests_ref }}
+          token: ${{ secrets.TESTS_REPO_TOKEN || github.token }}
+          path: tests-repo
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -switch "/Applications/Xcode_${{ inputs.xcode_version }}.app"
+          xcodebuild -version
+          mkdir -p "$ART"/{appium,screenshots,reports,logs}
+
+      # scripts/setup (full) installs linters and may prompt. For a simulator build only this is needed:
+      # it writes the git-ignored Configurations/OpenSourceDebug.xcconfig the Xcode project references.
+      # 'ci' skips the prompt (see scripts/setup_bundle_id). SwiftLint is optional (build phase only warns if missing).
+      - name: Repo setup (non-interactive)
+        run: scripts/setup_bundle_id ci
+
+      - name: Find simulator
+        id: sim
+        run: |
+          xcrun simctl list runtimes
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json,sys
+          name="${{ inputs.device_name }}"; ver="${{ inputs.ios_version }}"
+          d=json.load(sys.stdin)["devices"]
+          for rt,devs in d.items():
+              if rt.endswith("iOS-"+ver.replace(".","-")):
+                  for x in devs:
+                      if x["name"]==name and x["isAvailable"]:
+                          print(x["udid"]); sys.exit(0)
+          sys.exit(1)')
+          echo "UDID=$UDID" | tee -a "$GITHUB_ENV"
+
+      - name: Build Wikipedia for the iOS Simulator (no code signing)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project Wikipedia.xcodeproj -scheme "$SCHEME" -configuration "$CONFIGURATION" \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$DD" \
+            -onlyUsePackageVersionsFromResolvedFile -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee "$ART/logs/xcodebuild-app.log" | tail -n 40
+          APP="$DD/Build/Products/${CONFIGURATION}-iphonesimulator/Wikipedia.app"
+          test -d "$APP" || { echo "::error::Wikipedia.app not found at $APP"; find "$DD/Build/Products" -maxdepth 2; exit 1; }
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+
+      - name: Install Appium + XCUITest driver
+        run: |
+          npm install -g "appium@${{ inputs.appium_version }}"
+          V="${{ inputs.xcuitest_version }}"
+          appium driver install "xcuitest${V:+@$V}"
+          appium -v
+          appium driver list --installed
+
+      # Optional speed-up (verified option names: usePrebuiltWDA + derivedDataPath, appium-xcuitest-driver capabilities doc).
+      - name: Prebuild WebDriverAgent
+        if: inputs.prebuild_wda
+        continue-on-error: true
+        run: |
+          WDA_PROJ=$(find "$HOME/.appium" -name WebDriverAgent.xcodeproj -not -path "*/Pods/*" | head -1)
+          echo "WDA project: $WDA_PROJ"
+          xcodebuild build-for-testing \
+            -project "$WDA_PROJ" -scheme WebDriverAgentRunner \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$WDA_DD" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$ART/logs/xcodebuild-wda.log" | tail -n 15
+          echo "USE_PREBUILT_WDA=1" >> "$GITHUB_ENV"
+          echo "WDA_DERIVED_DATA=$WDA_DD" >> "$GITHUB_ENV"
+
+      - name: Boot simulator
+        run: |
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl list devices | grep "$UDID"
+
+      - name: Start Appium server (background)
+        run: |
+          nohup appium --address 127.0.0.1 --port 4723 --log-no-colors \
+            --log "$ART/appium/appium-server.log" > "$ART/appium/appium-stdout.log" 2>&1 &
+          for i in $(seq 1 30); do curl -sf "$APPIUM_URL/status" && break; sleep 2; done
+          curl -s "$APPIUM_URL/status"
+
+      - name: Export values the tests read
+        run: |
+          {
+            echo "DEVICE_NAME=${{ inputs.device_name }}"
+            echo "PLATFORM_VERSION=${{ inputs.ios_version }}"
+            echo "ARTIFACT_DIR=$ART"
+            echo "APPIUM_HOST=127.0.0.1"
+            echo "APPIUM_PORT=4723"
+            echo "PLATFORM_NAME=iOS"
+          } >> "$GITHUB_ENV"
+
+      # ---------- built-in smoke test: stdlib-only Python talking W3C WebDriver to Appium ----------
+      - name: Smoke test (launch app, screenshot, dump page source)
+        if: inputs.test_language == 'smoke'
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, urllib.request
+          base = os.environ["APPIUM_URL"]; art = os.environ["ARTIFACT_DIR"]
+          def call(method, path, body=None):
+              req = urllib.request.Request(base + path, method=method,
+                  data=json.dumps(body).encode() if body is not None else None,
+                  headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=600) as r:
+                  return json.load(r)["value"]
+          caps = {
+            "platformName": "iOS",
+            "appium:automationName": "XCUITest",
+            "appium:deviceName": os.environ["DEVICE_NAME"],
+            "appium:platformVersion": os.environ["PLATFORM_VERSION"],
+            "appium:udid": os.environ["UDID"],
+            "appium:app": os.environ["APP_PATH"],
+            "appium:wdaLaunchTimeout": 240000,
+            "appium:wdaConnectionTimeout": 240000,
+            "appium:wdaStartupRetries": 2,
+            "appium:newCommandTimeout": 300,
+            "appium:autoAcceptAlerts": True,
+          }
+          if os.environ.get("USE_PREBUILT_WDA"):
+              caps["appium:usePrebuiltWDA"] = True
+              caps["appium:derivedDataPath"] = os.environ["WDA_DERIVED_DATA"]
+          s = call("POST", "/session", {"capabilities": {"alwaysMatch": caps}})
+          sid = s["sessionId"]
+          try:
+              import time; time.sleep(8)
+              os.makedirs(art + "/smoke", exist_ok=True)
+              open(art + "/smoke/page_source.xml", "w").write(call("GET", f"/session/{sid}/source"))
+              open(art + "/screenshots/smoke.png", "wb").write(base64.b64decode(call("GET", f"/session/{sid}/screenshot")))
+              print("OK: session started; page source + screenshot saved")
+          finally:
+              call("DELETE", f"/session/{sid}")
+          PY
+
+      # ---------- consultant's TypeScript tests (WebdriverIO / any npm script) ----------
+      - name: Set up Node for the tests
+        if: inputs.test_language == 'typescript'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"   # the Appium server is already running on the runner's own Node; this only affects the test step
+
+      - name: Run TypeScript tests (npm ci + test command)
+        if: inputs.test_language == 'typescript'
+        run: |
+          ROOT="${{ inputs.tests_repo != '' && 'tests-repo' || '.' }}"
+          cd "$ROOT/${{ inputs.tests_dir }}"
+          pwd; ls
+          npm ci
+          ${{ inputs.test_command }}
+
+      # ---------- consultant's Python tests ----------
+      - name: Run Python tests (pytest)
+        if: inputs.test_language == 'python'
+        working-directory: ${{ inputs.test_dir }}/python
+        run: |
+          python3 -m venv .venv && . .venv/bin/activate
+          pip install -r requirements.txt
+          pytest -v --junitxml="$ART/reports/pytest-junit.xml"
+
+      # ---------- consultant's Java tests ----------
+      - name: Run Java tests (Maven)
+        if: inputs.test_language == 'java'
+        working-directory: ${{ inputs.test_dir }}/java
+        run: |
+          which mvn || brew install maven
+          mvn -B test
+          mkdir -p "$ART/reports/surefire" && cp -R target/surefire-reports/. "$ART/reports/surefire/" || true
+
+      # ---------- always: evidence for debugging ----------
+      - name: Final screenshot + simulator log + WDA/Appium state
+        if: always()
+        run: |
+          xcrun simctl io "$UDID" screenshot "$ART/screenshots/final-simulator.png" || true
+          xcrun simctl spawn "$UDID" log show --last 10m --style compact > "$ART/logs/simulator-syslog.txt" 2>&1 || true
+          cp -R ~/Library/Logs/CoreSimulator "$ART/logs/CoreSimulator" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ios-test-results
+          path: artifacts
+          retention-days: 7   # free plans have 500 MB artifact storage; keep this small
+          if-no-files-found: warn
